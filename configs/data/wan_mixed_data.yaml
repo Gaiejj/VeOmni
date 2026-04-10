@@ -1,0 +1,18 @@
+# Example: Image + Video mixed training via WeightedMultiSourceDataset
+#
+# Use this file as the `train_path` in a dit training config to enable
+# weighted sampling from multiple data sources (e.g. images and videos).
+#
+# The `schedule` controls how samples are drawn from each source.
+# With `const` schedule and weights [0.7, 0.3], roughly 70% of samples
+# come from the image dataset and 30% from the video dataset.
+
+sources:
+  - /path/to/image_dataset
+  - /path/to/video_dataset
+names:
+  - images
+  - videos
+schedule:
+  - schedule_type: const
+    weights: [0.7, 0.3]  # 70% images, 30% videos

@@ -15,6 +15,7 @@
 
 
 import os
+from typing import Tuple
 
 import imageio
 import numpy as np
@@ -50,14 +51,65 @@ class TextVideoDataset(torch.utils.data.Dataset):
         self.width = width
         self.is_i2v = is_i2v
 
+        self._build_transforms()
+
+    def _build_transforms(self):
+        """Build frame processing transforms for current (height, width)."""
         self.frame_process = v2.Compose(
             [
-                v2.CenterCrop(size=(height, width)),
-                v2.Resize(size=(height, width), antialias=True),
+                v2.CenterCrop(size=(self.height, self.width)),
+                v2.Resize(size=(self.height, self.width), antialias=True),
                 v2.ToTensor(),
                 v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
             ]
         )
+
+    def set_resolution(self, height: int, width: int):
+        """Set target resolution for subsequent ``__getitem__`` calls.
+
+        This allows the bucket sampler to dynamically change the resolution
+        that this dataset resizes frames to, without re-creating the dataset.
+
+        Args:
+            height: Target frame height in pixels.
+            width: Target frame width in pixels.
+        """
+        self.height = height
+        self.width = width
+        self._build_transforms()
+
+    def get_resolution(self, idx: int) -> Tuple[int, int]:
+        """Get the native resolution (height, width) of the sample at *idx*.
+
+        Reads metadata without fully decoding video frames.  Falls back to
+        the dataset's configured ``(height, width)`` when metadata cannot be
+        determined.
+
+        Args:
+            idx: Sample index.
+
+        Returns:
+            Tuple of (height, width).
+        """
+        path = self.path[idx]
+        if self.is_image(path):
+            try:
+                with Image.open(path) as img:
+                    return img.height, img.width
+            except Exception:
+                return self.height, self.width
+        else:
+            try:
+                reader = imageio.get_reader(path)
+                meta = reader.get_meta_data()
+                size = meta.get("size", None)
+                reader.close()
+                if size is not None:
+                    # imageio 'size' is (width, height)
+                    return size[1], size[0]
+                return self.height, self.width
+            except Exception:
+                return self.height, self.width
 
     def crop_and_resize(self, image):
         width, height = image.size
@@ -153,14 +205,48 @@ class TextImageDataset(torch.utils.data.Dataset):
         self.text = metadata["text"].to_list()
         self.height = height
         self.width = width
+        self.center_crop = center_crop
+        self.random_flip = random_flip
+        self._build_transforms()
+
+    def _build_transforms(self):
+        """Build image processing transforms for current (height, width)."""
         self.image_processor = transforms.Compose(
             [
-                transforms.CenterCrop((height, width)) if center_crop else transforms.RandomCrop((height, width)),
-                transforms.RandomHorizontalFlip() if random_flip else transforms.Lambda(lambda x: x),
+                transforms.CenterCrop((self.height, self.width))
+                if self.center_crop
+                else transforms.RandomCrop((self.height, self.width)),
+                transforms.RandomHorizontalFlip() if self.random_flip else transforms.Lambda(lambda x: x),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5]),
             ]
         )
+
+    def set_resolution(self, height: int, width: int):
+        """Set target resolution for subsequent ``__getitem__`` calls.
+
+        Args:
+            height: Target image height in pixels.
+            width: Target image width in pixels.
+        """
+        self.height = height
+        self.width = width
+        self._build_transforms()
+
+    def get_resolution(self, idx: int) -> Tuple[int, int]:
+        """Get the native resolution (height, width) of the sample at *idx*.
+
+        Args:
+            idx: Sample index.
+
+        Returns:
+            Tuple of (height, width).
+        """
+        try:
+            with Image.open(self.path[idx]) as img:
+                return img.height, img.width
+        except Exception:
+            return self.height, self.width
 
     def __getitem__(self, index):
         data_id = torch.randint(0, len(self.path), (1,))[0]

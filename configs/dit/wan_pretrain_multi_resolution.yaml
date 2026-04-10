@@ -1,0 +1,73 @@
+# Example: Multi-resolution pre-training with bucket sampling
+#
+# This config demonstrates how to train a Wan2.1 model across multiple
+# resolutions (256, 480p, 720p) using the resolution bucket sampler.
+# All samples in a batch share the same resolution; batch order is shuffled
+# across buckets each epoch.
+#
+# To mix images and videos, use a WeightedMultiSourceDataset via a
+# multi-source YAML (see configs/data/wan_mixed_data.yaml).
+
+model:
+  model_path: Wan-AI/Wan2.1-T2V-14B
+  config_path: ./configs/model_configs/wan/wan_14b.json
+  ops_implementation:
+    attn_implementation: flash_attention_2
+
+data:
+  train_path: /path/to/your/dataset
+  train_size: 1000000000000
+  dataloader:
+    type: native
+    drop_last: true
+  datasets_type: mapping
+  data_type: diffusion
+  max_seq_len: 8192
+  text_keys: text
+  # --- Multi-resolution bucket sampling ---
+  use_bucket_sampler: true
+  # Optional: restrict to specific buckets (default uses all 256/480/720 buckets)
+  # resolution_buckets:
+  #   - [480, 832]   # 480p 16:9
+  #   - [480, 640]   # 480p 4:3
+  #   - [720, 1280]  # 720p 16:9
+
+train:
+  accelerator:
+    dp_replicate_size: 1
+    ulysses_size: 4
+    fsdp_config:
+      fsdp_mode: fsdp1
+      full_shard: true
+      offload: false
+      mixed_precision:
+        enable: false
+    offload:
+      enable_activation: false
+  gradient_checkpointing:
+    enable: true
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_warmup_ratio: 0.007
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  init_device: cuda
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  checkpoint:
+    output_dir: wan2.1-pretrain-multi-res
+    manager: dcp
+    save_epochs: 1
+    save_hf_weights: true
+  max_steps: 10000
+  num_train_epochs: 100
+  wandb:
+    enable: false
+    project: Wan2.1-Pretrain
+    name: multi_resolution_pretrain

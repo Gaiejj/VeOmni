@@ -18,7 +18,7 @@ import pickle as pk
 from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, Dict, Literal, Optional, Sequence
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -121,6 +121,16 @@ class OfflineEmbeddingSaver:
 
 @dataclass
 class DiTDataCollator(DataCollator):
+    """Collator for DiT training data.
+
+    When ``stack_tensors`` is True (e.g. when using bucket sampling where all
+    items share the same resolution), tensors with matching shapes are stacked
+    into a single tensor for more efficient downstream processing.  Otherwise
+    values are collected into plain lists (the original behaviour).
+    """
+
+    stack_tensors: bool = False
+
     def __call__(self, features: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:
         batch = defaultdict(list)
 
@@ -128,6 +138,19 @@ class DiTDataCollator(DataCollator):
         for feature in features:
             for key in feature.keys():
                 batch[key].append(feature[key])
+
+        if self.stack_tensors:
+            stacked = {}
+            for key, vals in batch.items():
+                if isinstance(vals[0], torch.Tensor):
+                    try:
+                        stacked[key] = torch.stack(vals)
+                    except RuntimeError:
+                        # Shape mismatch fallback — keep as list
+                        stacked[key] = vals
+                else:
+                    stacked[key] = vals
+            return stacked
 
         return batch
 
@@ -157,6 +180,19 @@ class DiTDataArguments(DataArguments):
     shuffle: bool = field(
         default=True,
         metadata={"help": "Whether or not to shuffle the dataset."},
+    )
+    use_bucket_sampler: bool = field(
+        default=False,
+        metadata={"help": "Enable resolution bucket sampling for multi-resolution training."},
+    )
+    resolution_buckets: Optional[List[List[int]]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "List of [height, width] pairs defining resolution buckets. "
+                "If None, uses ALL_RESOLUTION_BUCKETS from bucket_sampler."
+            )
+        },
     )
 
 
@@ -386,30 +422,111 @@ class DiTTrainer:
                 * args.train.global_batch_size
             )
 
+    def _build_bucket_sampler(self):
+        """Build a resolution bucket batch sampler if configured.
+
+        Returns:
+            A ``ResolutionBucketBatchSampler`` instance, or ``None`` if bucket
+            sampling is not enabled or the dataset does not support it.
+        """
+        args: VeOmniDiTArguments = self.base.args
+        if not args.data.use_bucket_sampler:
+            return None
+
+        dataset = self.base.train_dataset
+        if not hasattr(dataset, "get_resolution"):
+            logger.info_rank0(
+                "Bucket sampler enabled but dataset has no get_resolution(); falling back to default sampling."
+            )
+            return None
+
+        from ..data.diffusion.bucket_sampler import (
+            ALL_RESOLUTION_BUCKETS,
+            ResolutionBucketBatchSampler,
+        )
+
+        buckets: Optional[List[Tuple[int, int]]] = None
+        if args.data.resolution_buckets is not None:
+            buckets = [tuple(pair) for pair in args.data.resolution_buckets]
+
+        # Build resolution map by scanning dataset metadata
+        logger.info_rank0("Scanning dataset for resolution metadata (bucket assignment)...")
+        resolution_map: Dict[int, Tuple[int, int]] = {}
+        for idx in range(len(dataset)):
+            resolution_map[idx] = dataset.get_resolution(idx)
+        logger.info_rank0(f"Resolution scan complete: {len(resolution_map)} samples.")
+
+        parallel_state = get_parallel_state()
+        sampler = ResolutionBucketBatchSampler(
+            dataset_size=len(dataset),
+            resolution_map=resolution_map,
+            batch_size=args.train.dataloader_batch_size,
+            buckets=buckets or ALL_RESOLUTION_BUCKETS,
+            drop_last=args.data.dataloader.drop_last,
+            shuffle=args.data.shuffle,
+            seed=args.train.seed,
+            rank=parallel_state.dp_rank,
+            world_size=parallel_state.dp_size,
+        )
+        return sampler
+
     def _build_dataloader(self):
-        """Build dataloader with dyn_bsz=False for DiT (fixed batch)."""
+        """Build dataloader with dyn_bsz=False for DiT (fixed batch).
+
+        When ``use_bucket_sampler`` is enabled, a
+        :class:`ResolutionBucketBatchSampler` replaces the default sampler so
+        that every batch contains samples of the same resolution.
+        """
         args = self.base.args
         if not get_parallel_state().sp_enabled or get_parallel_state().sp_rank == 0:
-            self.base.train_dataloader = build_dataloader(
-                dataloader_type=args.data.dataloader.type,
-                dataset=self.base.train_dataset,
-                micro_batch_size=args.train.micro_batch_size,
-                global_batch_size=args.train.global_batch_size,
-                dataloader_batch_size=args.train.dataloader_batch_size,
-                max_seq_len=args.data.max_seq_len,
-                train_steps=args.train_steps,
-                bsz_warmup_ratio=args.train.bsz_warmup_ratio,
-                bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
-                dyn_bsz=args.train.dyn_bsz,
-                dyn_bsz_runtime=args.train.dyn_bsz_runtime,
-                dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
-                num_workers=args.data.dataloader.num_workers,
-                drop_last=args.data.dataloader.drop_last,
-                pin_memory=args.data.dataloader.pin_memory,
-                prefetch_factor=args.data.dataloader.prefetch_factor,
-                seed=args.train.seed,
-                collate_fn=DiTDataCollator(),
-            )
+            bucket_sampler = self._build_bucket_sampler()
+
+            if bucket_sampler is not None:
+                # Use bucket batch sampler — bypass the standard build_dataloader
+                # path which creates its own sampler.
+                from ..data.data_loader import DistributedDataloader
+
+                collate_fn = DiTDataCollator(stack_tensors=True)
+                from ..data.data_collator import MakeMicroBatchCollator
+
+                num_micro_batch = args.train.global_batch_size // (
+                    args.train.micro_batch_size * get_parallel_state().dp_size
+                )
+                collate_fn = MakeMicroBatchCollator(
+                    num_micro_batch=num_micro_batch,
+                    internal_data_collator=collate_fn,
+                )
+
+                self.base.train_dataloader = DistributedDataloader(
+                    self.base.train_dataset,
+                    batch_sampler=bucket_sampler,
+                    num_workers=args.data.dataloader.num_workers,
+                    collate_fn=collate_fn,
+                    pin_memory=args.data.dataloader.pin_memory,
+                    prefetch_factor=args.data.dataloader.prefetch_factor,
+                )
+                logger.info_rank0(f"Built bucket-sampled dataloader with {len(bucket_sampler)} batches.")
+            else:
+                self.base.train_dataloader = build_dataloader(
+                    dataloader_type=args.data.dataloader.type,
+                    dataset=self.base.train_dataset,
+                    micro_batch_size=args.train.micro_batch_size,
+                    global_batch_size=args.train.global_batch_size,
+                    dataloader_batch_size=args.train.dataloader_batch_size,
+                    max_seq_len=args.data.max_seq_len,
+                    train_steps=args.train_steps,
+                    bsz_warmup_ratio=args.train.bsz_warmup_ratio,
+                    bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
+                    dyn_bsz=args.train.dyn_bsz,
+                    dyn_bsz_runtime=args.train.dyn_bsz_runtime,
+                    dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
+                    num_workers=args.data.dataloader.num_workers,
+                    drop_last=args.data.dataloader.drop_last,
+                    pin_memory=args.data.dataloader.pin_memory,
+                    prefetch_factor=args.data.dataloader.prefetch_factor,
+                    seed=args.train.seed,
+                    collate_fn=DiTDataCollator(),
+                )
         else:
             self.base.train_dataloader = None
 
