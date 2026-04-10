@@ -70,6 +70,7 @@ from ..utils.loss_utils import count_loss_token, mean_global_loss
 from ..utils.model_utils import pretty_print_trainable_parameters
 from .callbacks import (
     CheckpointerCallback,
+    EMACallback,
     EnvironMeterCallback,
     EvaluateCallback,
     HFLoraCkptCallback,
@@ -388,6 +389,20 @@ class BaseTrainer(Stateful, ABC):
             self.hf_ckpt_callback = HuggingfaceCkptCallback(self)
         self.evaluate_callback = EvaluateCallback(self)
         self.moe_monitor_callback = MoERouterMonitorCallback(self)
+
+        # EMA callback (optional, gated by config)
+        if getattr(self.args.train, "ema", None) is not None and self.args.train.ema.enable:
+            ema_cfg = self.args.train.ema
+            self.ema_callback = EMACallback(
+                self,
+                decay=ema_cfg.decay,
+                warmup_steps=ema_cfg.warmup_steps,
+                update_after_step=ema_cfg.update_after_step,
+                update_every=ema_cfg.update_every,
+            )
+        else:
+            self.ema_callback = None
+
         self.state = TrainerState()
 
     def on_train_begin(self):
@@ -446,6 +461,8 @@ class BaseTrainer(Stateful, ABC):
         self.hf_ckpt_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.evaluate_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.moe_monitor_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        if self.ema_callback is not None:
+            self.ema_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass."""

@@ -38,7 +38,8 @@ logger = logging.get_logger(__name__)
 #   │   ├── fsdp_config.*    → FSDPConfig
 #   │   |   └── mixed_precision.* → MixedPrecisionConfig
 #   │   └── offload_config.* → OffloadConfig
-#   └── checkpoint.*         → CheckpointConfig
+#   ├── checkpoint.*         → CheckpointConfig
+#   └── ema.*                → EMAConfig
 #
 
 
@@ -371,6 +372,32 @@ class CheckpointConfig:
 
 
 @dataclass
+class EMAConfig:
+    """train.ema.* — Exponential Moving Average settings."""
+
+    enable: bool = field(
+        default=False,
+        metadata={"help": "Enable EMA (Exponential Moving Average) of model parameters."},
+    )
+    decay: float = field(
+        default=0.9999,
+        metadata={"help": "EMA decay factor."},
+    )
+    warmup_steps: int = field(
+        default=0,
+        metadata={"help": "Number of steps to linearly warmup decay from 0 to target."},
+    )
+    update_after_step: int = field(
+        default=0,
+        metadata={"help": "Start EMA updates after this many steps."},
+    )
+    update_every: int = field(
+        default=1,
+        metadata={"help": "Update EMA every N steps."},
+    )
+
+
+@dataclass
 class TrainingArguments:
     """train.* — Top-level training configuration."""
 
@@ -472,6 +499,7 @@ class TrainingArguments:
     gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
+    ema: EMAConfig = field(default_factory=EMAConfig)
 
     def __post_init__(self):
         self._train_steps = -1
