@@ -34,6 +34,7 @@ from ..distributed.parallel_state import get_parallel_state
 from ..models import build_foundation_model
 from ..models.auto import build_config
 from ..models.loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+from ..optim import build_lr_scheduler
 from ..utils import helper
 from ..utils.device import (
     get_device_type,
@@ -41,6 +42,7 @@ from ..utils.device import (
 )
 from ..utils.model_utils import pretty_print_trainable_parameters
 from .base import BaseTrainer
+from .stage_controller import StageConfig, StageController
 
 
 logger = helper.create_logger(__name__)
@@ -205,6 +207,13 @@ class DiTTrainingArguments(TrainingArguments):
             "online_training: training raw data online. offline_embedding: embedding raw data."
         },
     )
+    stages_config: str = field(
+        default="",
+        metadata={
+            "help": "Path to a YAML file defining multi-stage progressive training. "
+            "When empty, training uses a single stage (existing behaviour)."
+        },
+    )
 
 
 @dataclass
@@ -229,6 +238,7 @@ class DiTTrainer:
     def __init__(self, args: VeOmniDiTArguments):
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
+        self.stage_controller: Optional[StageController] = None
 
         # rewrite _setup, setup arguments for dit training
         self._setup()
@@ -261,6 +271,9 @@ class DiTTrainer:
             self.base._build_training_context()
 
         self.base._init_callbacks()
+
+        # Initialize multi-stage controller (after all base setup)
+        self._init_stage_controller()
 
     def _setup(self):
         self.base._setup()
@@ -677,9 +690,146 @@ class DiTTrainer:
 
         self.on_step_end(loss=total_loss, loss_dict=dict(total_loss_dict), grad_norm=grad_norm)
 
-    def train(self):
+    # ---- Multi-stage progressive training helpers ----
+
+    @staticmethod
+    def _load_stages_config(config_path: str) -> List[StageConfig]:
+        """Load stage definitions from a YAML file."""
+        import yaml
+
+        with open(config_path) as f:
+            raw = yaml.safe_load(f)
+
+        stages: List[StageConfig] = []
+        for entry in raw["stages"]:
+            stages.append(StageConfig(**entry))
+        return stages
+
+    def _init_stage_controller(self):
+        """Build the StageController if a stages_config path is provided."""
+        args: VeOmniDiTArguments = self.base.args
+        stages_config_path = getattr(args.train, "stages_config", "")
+        if stages_config_path:
+            stages = self._load_stages_config(stages_config_path)
+            self.stage_controller = StageController(stages)
+        else:
+            self.stage_controller = None
+
+    def _apply_stage_config(self, stage: StageConfig):
+        """Apply stage-specific configuration overrides.
+
+        Updates the learning rate for all optimizer param groups and rebuilds
+        the LR scheduler with the new peak LR and warmup steps.  The optimizer
+        state (momentum / second-moment estimates) is preserved.
+        """
+        args: VeOmniDiTArguments = self.base.args
+
+        # Update optimizer LR for all param groups
+        for param_group in self.base.optimizer.param_groups:
+            param_group["lr"] = stage.lr
+
+        # Rebuild LR scheduler for this stage
+        self.base.lr_scheduler = build_lr_scheduler(
+            self.base.optimizer,
+            train_steps=stage.max_steps,
+            lr=stage.lr,
+            lr_min=args.train.optimizer.lr_min,
+            lr_decay_style=args.train.optimizer.lr_decay_style,
+            lr_decay_ratio=args.train.optimizer.lr_decay_ratio,
+            lr_warmup_ratio=stage.lr_warmup_steps / max(stage.max_steps, 1),
+            lr_start=args.train.optimizer.lr_start,
+        )
+
+        # Update resolution / max_frames in mm_configs so that the data
+        # transform and any downstream dataset sampling respects them.
+        mm = args.data.mm_configs
+        if stage.resolution:
+            mm["resolution"] = stage.resolution
+        mm["max_frames"] = stage.max_frames
+
+        # If the stage specifies a different data_path, update it.
+        if stage.data_path:
+            args.data.train_path = stage.data_path
+
+        # If the stage specifies a different global_batch_size, update it.
+        if stage.global_batch_size > 0:
+            args.train.global_batch_size = stage.global_batch_size
+            args.train._derive_batch_config()
+            args.train.dataloader_batch_size = args.train.global_batch_size // get_parallel_state().dp_size
+
+        logger.info_rank0(
+            f"Applied stage config: name={stage.name}, lr={stage.lr}, "
+            f"resolution={stage.resolution}, max_frames={stage.max_frames}"
+        )
+
+    def _save_stage_checkpoint(self):
+        """Save a checkpoint at a stage boundary via the existing callback."""
+        self.base.checkpointer_callback._save_checkpoint(self.base.state)
+
+    def _rebuild_dataloader_for_stage(self):
+        """Rebuild data transform and dataloader for the current stage."""
+        self._build_data_transform()
+        self._build_dataset()
+        self._build_dataloader()
+
+    def _train_staged(self):
+        """Multi-stage progressive training loop.
+
+        Iterates through stages defined in the StageController.  Each stage
+        runs its own inner training loop.  At stage boundaries a checkpoint is
+        saved and the dataloader / LR scheduler are rebuilt.
+        """
+        while not self.stage_controller.is_finished:
+            stage = self.stage_controller.current_stage
+            stage_idx = self.stage_controller.current_stage_idx
+            logger.info_rank0(
+                f"=== Starting stage {stage_idx}: {stage.name} "
+                f"(remaining {stage.max_steps - self.stage_controller.steps_in_current_stage} steps) ==="
+            )
+
+            # Apply stage-specific overrides (LR, resolution, batch size, data)
+            self._apply_stage_config(stage)
+
+            # Rebuild dataloader when entering a new stage (unless resuming the
+            # very first stage from step 0 — the dataloader was already built).
+            if stage_idx > 0 or self.stage_controller.steps_in_current_stage > 0:
+                self._rebuild_dataloader_for_stage()
+
+            # Create data iterator
+            if self.base.train_dataloader is not None:
+                data_iterator = iter(self.base.train_dataloader)
+            else:
+                data_iterator = None
+
+            remaining_steps = stage.max_steps - self.stage_controller.steps_in_current_stage
+
+            for _ in range(remaining_steps):
+                try:
+                    self.train_step(data_iterator)
+                except StopIteration:
+                    # Exhausted current dataloader — wrap around.
+                    if self.base.train_dataloader is not None:
+                        data_iterator = iter(self.base.train_dataloader)
+                    try:
+                        self.train_step(data_iterator)
+                    except StopIteration:
+                        logger.info_rank0(f"Stage {stage.name}: dataloader exhausted even after reset, ending stage.")
+                        break
+
+                self.stage_controller.step()
+
+                if self.stage_controller.should_advance():
+                    break
+
+            # Stage finished — save checkpoint and advance
+            self._save_stage_checkpoint()
+            next_stage = self.stage_controller.advance()
+            if next_stage is None:
+                break
+
+    def _train_single_stage(self):
+        """Original single-stage training loop (unchanged behaviour)."""
         args = self.base.args
-        self.on_train_begin()
         if self.training_task == "offline_embedding":
             args.train.num_train_epochs = 1
 
@@ -712,6 +862,14 @@ class DiTTrainer:
             self.on_epoch_end()
             self.base.start_step = 0
             helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+
+    def train(self):
+        self.on_train_begin()
+
+        if self.stage_controller is not None:
+            self._train_staged()
+        else:
+            self._train_single_stage()
 
         self.on_train_end()
 
