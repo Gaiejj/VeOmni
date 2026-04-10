@@ -92,6 +92,12 @@ class CheckpointerCallback(Callback):
 
         self.trainer.environ_meter.load_state_dict(state["extra_state"]["environ_meter"])
         torch.set_rng_state(state["extra_state"]["torch_rng_state"])
+
+        # Restore multi-stage controller state when available.
+        stage_ctrl = getattr(self.trainer, "stage_controller", None)
+        if stage_ctrl is not None and "stage_controller" in state["extra_state"]:
+            stage_ctrl.load_state_dict(state["extra_state"]["stage_controller"])
+
         if self.trainer.start_step == 0:
             # If resume at the end of epoch, clear resume state and prefetch data
             iter(self.trainer.train_dataloader)
@@ -105,16 +111,23 @@ class CheckpointerCallback(Callback):
 
         save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{state.global_step}")
 
+        extra_state = {
+            "global_step": state.global_step,
+            "lr_scheduler": self.trainer.lr_scheduler.state_dict(),
+            "train_dataloader": self.trainer.train_dataloader.state_dict(),
+            "environ_meter": self.trainer.environ_meter.state_dict(),
+            "torch_rng_state": torch.get_rng_state(),
+        }
+
+        # Persist multi-stage controller state when available.
+        stage_ctrl = getattr(self.trainer, "stage_controller", None)
+        if stage_ctrl is not None:
+            extra_state["stage_controller"] = stage_ctrl.state_dict()
+
         ckpt_state = {
             "model": self.trainer.model,
             "optimizer": self.trainer.optimizer,
-            "extra_state": {
-                "global_step": state.global_step,
-                "lr_scheduler": self.trainer.lr_scheduler.state_dict(),
-                "train_dataloader": self.trainer.train_dataloader.state_dict(),
-                "environ_meter": self.trainer.environ_meter.state_dict(),
-                "torch_rng_state": torch.get_rng_state(),
-            },
+            "extra_state": extra_state,
         }
         self.trainer.checkpointer.save(save_checkpoint_path, ckpt_state, save_async=args.train.checkpoint.save_async)
 

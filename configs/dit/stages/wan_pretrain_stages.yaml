@@ -1,0 +1,38 @@
+# Multi-stage progressive pre-training schedule for Wan2.1.
+# Referenced by the main config via train.stages_config.
+
+stages:
+  - name: "256px_image"
+    resolution: [256, 256]
+    max_frames: 1
+    lr: 2e-4
+    lr_warmup_steps: 1000
+    max_steps: 200000
+
+  - name: "480p_image"
+    resolution: [480, 832]
+    max_frames: 1
+    lr: 1e-4
+    lr_warmup_steps: 500
+    max_steps: 50000
+
+  - name: "480p_video_17f"
+    resolution: [480, 832]
+    max_frames: 17
+    lr: 5e-5
+    lr_warmup_steps: 500
+    max_steps: 100000
+
+  - name: "480p_video_49f"
+    resolution: [480, 832]
+    max_frames: 49
+    lr: 2e-5
+    lr_warmup_steps: 200
+    max_steps: 50000
+
+  - name: "720p_video"
+    resolution: [720, 1280]
+    max_frames: 49
+    lr: 1e-5
+    lr_warmup_steps: 200
+    max_steps: 50000
