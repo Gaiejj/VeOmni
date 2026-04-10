@@ -92,6 +92,13 @@ class CheckpointerCallback(Callback):
 
         self.trainer.environ_meter.load_state_dict(state["extra_state"]["environ_meter"])
         torch.set_rng_state(state["extra_state"]["torch_rng_state"])
+
+        # Restore EMA state if available
+        if (
+            state["extra_state"].get("ema", None) is not None
+            and getattr(self.trainer, "ema_callback", None) is not None
+        ):
+            self.trainer.ema_callback.load_state_dict(state["extra_state"]["ema"])
         if self.trainer.start_step == 0:
             # If resume at the end of epoch, clear resume state and prefetch data
             iter(self.trainer.train_dataloader)
@@ -114,6 +121,11 @@ class CheckpointerCallback(Callback):
                 "train_dataloader": self.trainer.train_dataloader.state_dict(),
                 "environ_meter": self.trainer.environ_meter.state_dict(),
                 "torch_rng_state": torch.get_rng_state(),
+                **(
+                    {"ema": self.trainer.ema_callback.state_dict()}
+                    if getattr(self.trainer, "ema_callback", None) is not None
+                    else {}
+                ),
             },
         }
         self.trainer.checkpointer.save(save_checkpoint_path, ckpt_state, save_async=args.train.checkpoint.save_async)
