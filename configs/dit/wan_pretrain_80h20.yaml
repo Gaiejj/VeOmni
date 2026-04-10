@@ -1,0 +1,74 @@
+# Wan2.1 from-scratch pre-training on 80x H20 (10 nodes x 8 GPUs)
+# HSDP configuration: dp_replicate=10 (inter-node), dp_shard=8 (intra-node)
+
+model:
+  model_path: null  # From scratch - no pretrained weights
+  config_path: configs/model_configs/wan/want2v_1.3b.json
+  condition_model_path: /path/to/wan2.1-t2v-1.3b  # For VAE + T5 + scheduler
+  ops_implementation:
+    attn_implementation: flash_attention_2
+
+data:
+  train_path: /path/to/training_data
+  data_type: diffusion
+  datasets_type: mapping
+  text_keys: text
+  max_seq_len: 8192
+  dyn_bsz_buffer_size: 200
+  dataloader:
+    type: native
+    num_workers: 8
+    drop_last: true
+    pin_memory: true
+    prefetch_factor: 2
+
+train:
+  global_batch_size: 80  # 1 per GPU
+  micro_batch_size: 1
+  num_train_epochs: 1
+  max_steps: 200000
+  init_device: cuda
+  enable_full_determinism: false
+  empty_cache_steps: 500
+
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_warmup_ratio: 0.005  # ~1000 steps out of 200k
+    lr_decay_style: cosine
+    lr_decay_ratio: 1.0
+    lr_min: 1.0e-5
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+
+  accelerator:
+    dp_replicate_size: 10
+    dp_shard_size: 8
+    ulysses_size: 1  # Start without SP, enable later if needed
+    fsdp_config:
+      fsdp_mode: fsdp2
+      full_shard: true
+      reshard_after_forward: true
+      forward_prefetch: true
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+    offload_config:
+      enable_activation: false
+
+  gradient_checkpointing:
+    enable: true
+
+  checkpoint:
+    output_dir: /shared/checkpoints/wan_pretrain
+    manager: dcp
+    save_async: true
+    save_steps: 5000
+    save_hf_weights: true
+    hf_save_steps: 10000
+
+  wandb:
+    enable: true
+    project: wan-pretrain
+    name: 1.3b-80h20
