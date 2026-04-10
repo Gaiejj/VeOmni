@@ -555,6 +555,54 @@ class WanModel(PreTrainedModel):
 
         self.gradient_checkpointing = False
 
+        # Apply zero-init to residual output projections (DiT best practice).
+        # This makes each DiTBlock start as a no-op through the residual connection,
+        # and the head output starts at zero, which is critical for stable DiT convergence.
+        self._zero_init_residual_outputs()
+
+    def _init_weights(self, module):
+        """General weight initialization for from-scratch training.
+
+        Called by PreTrainedModel machinery. Applies Xavier uniform to all Linear
+        and Conv3d layers. Specific zero-init overrides for residual paths are
+        handled separately in ``_zero_init_residual_outputs``.
+        """
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Conv3d):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    def _zero_init_residual_outputs(self):
+        """Zero-initialize output projections on the residual path.
+
+        After general Xavier init, we zero out:
+        - Self-attention output projection (``self_attn.o``)
+        - Cross-attention output projection (``cross_attn.o``)
+        - FFN second linear layer (``ffn[2]``)
+        - Head output linear (``head.head``)
+
+        This ensures each block initially acts as an identity through the
+        residual connection, following the DiT initialization convention
+        (Peebles & Xie, 2023).
+        """
+        for block in self.blocks:
+            nn.init.zeros_(block.self_attn.o.weight)
+            if block.self_attn.o.bias is not None:
+                nn.init.zeros_(block.self_attn.o.bias)
+            nn.init.zeros_(block.cross_attn.o.weight)
+            if block.cross_attn.o.bias is not None:
+                nn.init.zeros_(block.cross_attn.o.bias)
+            nn.init.zeros_(block.ffn[2].weight)
+            if block.ffn[2].bias is not None:
+                nn.init.zeros_(block.ffn[2].bias)
+        nn.init.zeros_(self.head.head.weight)
+        if self.head.head.bias is not None:
+            nn.init.zeros_(self.head.head.bias)
+
     def patchify(self, x: torch.Tensor):
         x = self.patch_embedding(x)
         grid_size = x.shape[2:]

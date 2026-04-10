@@ -450,8 +450,23 @@ class DiTTrainer:
     def postforward(
         self, outputs: ModelOutput, micro_batch: Dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Postprocess model outputs after forward pass."""
+        """Postprocess model outputs after forward pass.
+
+        If ``micro_batch`` contains a ``loss_weight`` list (produced by timestep
+        importance sampling), the mean weight is applied to each loss term so
+        that the effective gradient reflects the chosen weighting strategy.
+        """
         loss_dict: Dict[str, torch.Tensor] = outputs.loss
+
+        # Apply per-sample loss weighting from timestep importance sampling
+        if "loss_weight" in micro_batch and micro_batch["loss_weight"] is not None:
+            weights = micro_batch["loss_weight"]
+            if isinstance(weights, list):
+                weight = torch.cat([w.flatten() for w in weights]).mean()
+            else:
+                weight = weights.mean()
+            loss_dict = {k: v * weight for k, v in loss_dict.items()}
+
         loss_dict = {k: v / self.base.args.train.micro_batch_size for k, v in loss_dict.items()}
         loss = torch.stack(list(loss_dict.values())).sum()
         return loss, loss_dict

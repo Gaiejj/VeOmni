@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
@@ -132,6 +133,74 @@ class WanTransformer3DConditionModel(PreTrainedModel):
 
         return {"latents": latents_list, "context": context_list}
 
+    def _sample_timesteps(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Sample training timesteps according to the configured strategy.
+
+        Args:
+            batch_size: Number of timesteps to sample.
+            device: Target device for the returned tensor.
+            dtype: Target dtype for the returned tensor.
+
+        Returns:
+            Tensor of shape ``(batch_size,)`` with sampled timesteps.
+        """
+        sampling = self.config.timestep_sampling
+        if sampling == "uniform":
+            timestep_ids = torch.randint(
+                0,
+                len(self.scheduler.timesteps),
+                (batch_size,),
+                device=self.generator.device,
+                generator=self.generator,
+            )
+            return self.scheduler.timesteps[timestep_ids].to(device=device, dtype=dtype)
+        elif sampling == "logit_normal":
+            u = torch.normal(
+                mean=self.config.logit_normal_mean,
+                std=self.config.logit_normal_std,
+                size=(batch_size,),
+                device=self.generator.device,
+                generator=self.generator,
+            )
+            u = torch.sigmoid(u)  # Map to [0, 1]
+            # Apply flow-matching shift
+            u = self.config.shift * u / (1 + (self.config.shift - 1) * u)
+            timestep = u * self.config.num_train_timesteps
+            return timestep.to(device=device, dtype=dtype)
+        elif sampling == "cosmap":
+            u = torch.rand(batch_size, device=self.generator.device, generator=self.generator)
+            u = 1 - torch.cos(u * math.pi / 2)  # Cosine mapping, concentrates in middle
+            # Apply flow-matching shift
+            u = self.config.shift * u / (1 + (self.config.shift - 1) * u)
+            timestep = u * self.config.num_train_timesteps
+            return timestep.to(device=device, dtype=dtype)
+        else:
+            raise ValueError(f"Unknown timestep_sampling strategy: {sampling}")
+
+    def _compute_loss_weight(self, timestep: torch.Tensor) -> torch.Tensor:
+        """Compute per-sample loss weights based on the sampled timesteps.
+
+        Args:
+            timestep: Tensor of shape ``(batch_size,)`` with timestep values.
+
+        Returns:
+            Tensor of shape ``(batch_size,)`` with loss weights.
+        """
+        weighting = self.config.loss_weighting
+        if weighting == "none":
+            return torch.ones_like(timestep)
+        elif weighting == "min_snr":
+            # For rectified flow: SNR = (1 - sigma)^2 / sigma^2
+            sigma = timestep / self.config.num_train_timesteps
+            snr = ((1 - sigma) / sigma.clamp(min=1e-6)) ** 2
+            min_snr_gamma = 5.0
+            return torch.clamp(snr, max=min_snr_gamma) / snr
+        elif weighting == "cosmap":
+            sigma = timestep / self.config.num_train_timesteps
+            return 1.0 / (1.0 - sigma + 1e-6)
+        else:
+            raise ValueError(f"Unknown loss_weighting strategy: {weighting}")
+
     def process_condition(self, latents: list[torch.Tensor], context: list[torch.Tensor]) -> dict[str, Any]:
         if not self._timesteps_ready:
             self.scheduler.set_timesteps(self.config.num_train_timesteps, device=latents[0].device)
@@ -143,6 +212,7 @@ class WanTransformer3DConditionModel(PreTrainedModel):
             "encoder_hidden_states": [],
             "training_target": [],
             "latents": [],
+            "loss_weight": [],
         }
         for sample_latents, sample_context in zip(latents, context):
             latents = DiagonalGaussianDistribution(sample_latents).mode()
@@ -150,16 +220,20 @@ class WanTransformer3DConditionModel(PreTrainedModel):
             noise = torch.randn(  # TODO: use randn_like(generator=self.generator) when updating to torch 2.10.0
                 latents.shape, dtype=latents.dtype, device=self.generator.device, generator=self.generator
             ).to(self.generator.device)
-            timestep_ids = torch.randint(
-                0,
-                len(self.scheduler.timesteps),
-                (latents.shape[0],),
-                device=self.generator.device,
-                generator=self.generator,
-            ).to(latents.device)
-            timestep = self.scheduler.timesteps[timestep_ids].to(device=latents.device, dtype=latents.dtype)
-            noisy_latents = self.scheduler.scale_noise(latents, timestep, noise)
+
+            timestep = self._sample_timesteps(latents.shape[0], latents.device, latents.dtype)
+
+            # Compute noisy latents: for non-uniform sampling the timestep may be
+            # continuous, so we compute the linear interpolation directly instead
+            # of relying on scheduler.scale_noise which expects discrete timesteps.
+            if self.config.timestep_sampling == "uniform":
+                noisy_latents = self.scheduler.scale_noise(latents, timestep, noise)
+            else:
+                sigma = (timestep / self.config.num_train_timesteps).view(-1, 1, 1, 1, 1)
+                noisy_latents = (1 - sigma) * latents + sigma * noise
+
             training_target = noise - latents
+            loss_weight = self._compute_loss_weight(timestep)
 
             use_negative_context = (
                 torch.rand((), device=self.generator.device, generator=self.generator) < self.config.cfg_negative_prob
@@ -174,5 +248,6 @@ class WanTransformer3DConditionModel(PreTrainedModel):
             packed_conditions["encoder_hidden_states"].append(sample_context)
             packed_conditions["training_target"].append(training_target)
             packed_conditions["latents"].append(latents)
+            packed_conditions["loss_weight"].append(loss_weight)
 
         return packed_conditions
