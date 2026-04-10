@@ -77,7 +77,9 @@ def find_nearest_bucket(height: int, width: int, buckets: List[Tuple[int, int]])
     best_diff = float("inf")
     for bh, bw in buckets:
         bucket_ar = bw / bh
-        diff = abs(aspect_ratio - bucket_ar) + abs(height * width - bh * bw) / (height * width)
+        ar_diff = abs(aspect_ratio - bucket_ar) / max(aspect_ratio, bucket_ar)  # relative AR difference
+        pixel_diff = abs(height * width - bh * bw) / max(height * width, bh * bw)  # relative pixel difference
+        diff = ar_diff + 0.5 * pixel_diff  # AR is more important than pixel count
         if diff < best_diff:
             best_diff = diff
             best_bucket = (bh, bw)
@@ -148,23 +150,26 @@ class ResolutionBucketBatchSampler(Sampler):
 
         all_batches = []
         for _bucket, indices in self.bucket_indices.items():
+            indices = indices.copy()
             if self.shuffle:
                 perm = torch.randperm(len(indices), generator=g).tolist()
                 indices = [indices[i] for i in perm]
 
             # Distribute across ranks
-            rank_indices = indices[self.rank :: self.world_size]
+            # Ensure all ranks get equal sample counts to prevent deadlock
+            n_per_rank = len(indices) // self.world_size
+            rank_indices = indices[self.rank :: self.world_size][:n_per_rank]
 
             # Create batches
             for i in range(0, len(rank_indices), self.batch_size):
                 batch = rank_indices[i : i + self.batch_size]
-                if len(batch) == self.batch_size or not self.drop_last:
+                if len(batch) == self.batch_size:  # always drop incomplete batches for distributed safety
                     all_batches.append(batch)
 
         # Shuffle batch order across buckets so training sees varied resolutions
         if self.shuffle:
-            perm = torch.randperm(len(all_batches), generator=g).tolist()
-            all_batches = [all_batches[i] for i in perm]
+            batch_perm = torch.randperm(len(all_batches), generator=g).tolist()
+            all_batches = [all_batches[i] for i in batch_perm]
 
         yield from all_batches
 
@@ -172,7 +177,8 @@ class ResolutionBucketBatchSampler(Sampler):
         total = 0
         for indices in self.bucket_indices.values():
             n = len(indices) // self.world_size
-            if self.drop_last:
+            if self.drop_last or self.world_size > 1:
+                # Always drop incomplete batches in distributed mode to prevent deadlock
                 total += n // self.batch_size
             else:
                 total += math.ceil(n / self.batch_size)

@@ -28,6 +28,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# NCCL configuration for multi-node InfiniBand
+export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
+export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-0}
+export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-eth0}
+export NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX:-3}
+export NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL:-2}
+
 # Defaults
 NNODES=${NNODES:-1}
 NODE_RANK=${NODE_RANK:-0}

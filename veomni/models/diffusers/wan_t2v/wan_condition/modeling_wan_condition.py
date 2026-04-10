@@ -194,10 +194,11 @@ class WanTransformer3DConditionModel(PreTrainedModel):
             sigma = timestep / self.config.num_train_timesteps
             snr = ((1 - sigma) / sigma.clamp(min=1e-6)) ** 2
             min_snr_gamma = 5.0
-            return torch.clamp(snr, max=min_snr_gamma) / snr
+            return torch.clamp(snr, max=min_snr_gamma) / snr.clamp(min=1e-6)
         elif weighting == "cosmap":
             sigma = timestep / self.config.num_train_timesteps
-            return 1.0 / (1.0 - sigma + 1e-6)
+            weight = 1.0 / (1.0 - sigma + 1e-3)
+            return torch.clamp(weight, max=10.0)
         else:
             raise ValueError(f"Unknown loss_weighting strategy: {weighting}")
 

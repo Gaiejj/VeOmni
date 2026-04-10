@@ -57,6 +57,10 @@ class EMACallback(Callback):
         update_every: int = 1,
     ):
         super().__init__(trainer)
+        if not 0 <= decay <= 1:
+            raise ValueError(f"decay must be in [0, 1], got {decay}")
+        if update_every < 1:
+            raise ValueError(f"update_every must be >= 1, got {update_every}")
         self.target_decay = decay
         self.warmup_steps = warmup_steps
         self.update_after_step = update_after_step
@@ -71,7 +75,10 @@ class EMACallback(Callback):
         for param in model.parameters():
             if param.requires_grad:
                 # .data gives us the local shard in FSDP2
-                self.ema_params.append(param.data.clone().detach())
+                data = param.data
+                if hasattr(data, 'to_local'):
+                    data = data.to_local()
+                self.ema_params.append(data.clone().detach())
                 self.model_params.append(param)
 
         logger.info_rank0(
@@ -99,21 +106,30 @@ class EMACallback(Callback):
         for ema_p, model_p in zip(self.ema_params, self.model_params):
             # lerp_: ema_p = ema_p + (1 - decay) * (model_p.data - ema_p)
             #       = decay * ema_p + (1 - decay) * model_p.data
-            ema_p.lerp_(model_p.data, 1.0 - decay)
+            model_data = model_p.data
+            if hasattr(model_data, 'to_local'):
+                model_data = model_data.to_local()
+            ema_p.lerp_(model_data, 1.0 - decay)
 
     def on_step_end(
         self, state: TrainerState, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs
     ) -> None:
         """Update EMA after each optimizer step."""
-        if state.global_step % self.update_every == 0:
+        if self.update_every > 0 and state.global_step % self.update_every == 0:
             self._update(state.global_step)
 
     @torch.no_grad()
     def swap_to_ema(self):
         """Swap model weights with EMA weights (for evaluation)."""
         for ema_p, model_p in zip(self.ema_params, self.model_params):
-            tmp = model_p.data.clone()
-            model_p.data.copy_(ema_p)
+            model_data = model_p.data
+            if hasattr(model_data, 'to_local'):
+                local_data = model_data.to_local()
+                tmp = local_data.clone()
+                local_data.copy_(ema_p)
+            else:
+                tmp = model_data.clone()
+                model_data.copy_(ema_p)
             ema_p.copy_(tmp)
 
     @torch.no_grad()

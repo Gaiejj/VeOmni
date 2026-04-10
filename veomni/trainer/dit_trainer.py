@@ -463,9 +463,12 @@ class DiTTrainer:
             buckets = [tuple(pair) for pair in args.data.resolution_buckets]
 
         # Build resolution map by scanning dataset metadata
-        logger.info_rank0("Scanning dataset for resolution metadata (bucket assignment)...")
+        dataset_len = len(dataset)
+        logger.info_rank0(f"Scanning dataset for resolution metadata (bucket assignment): {dataset_len} samples...")
         resolution_map: Dict[int, Tuple[int, int]] = {}
-        for idx in range(len(dataset)):
+        for idx in range(dataset_len):
+            if idx % 10000 == 0:
+                logger.info_rank0(f"Scanning dataset resolutions: {idx}/{dataset_len}")
             resolution_map[idx] = dataset.get_resolution(idx)
         logger.info_rank0(f"Resolution scan complete: {len(resolution_map)} samples.")
 
@@ -588,13 +591,18 @@ class DiTTrainer:
         """
         loss_dict: Dict[str, torch.Tensor] = outputs.loss
 
-        # Apply per-sample loss weighting from timestep importance sampling
+        # Apply per-sample loss weighting from timestep importance sampling.
+        # NOTE: loss_dict values are already batch-averaged scalars at this point,
+        # so true per-sample weighting would need to happen before loss reduction.
+        # Here we apply the mean weight as a scalar multiplier with a safety clamp
+        # to prevent NaN/Inf propagation from degenerate weights.
         if "loss_weight" in micro_batch and micro_batch["loss_weight"] is not None:
             weights = micro_batch["loss_weight"]
             if isinstance(weights, list):
                 weight = torch.cat([w.flatten() for w in weights]).mean()
             else:
                 weight = weights.mean()
+            weight = torch.clamp(weight, min=0.1, max=10.0)  # safety clamp
             loss_dict = {k: v * weight for k, v in loss_dict.items()}
 
         loss_dict = {k: v / self.base.args.train.micro_batch_size for k, v in loss_dict.items()}
@@ -637,7 +645,12 @@ class DiTTrainer:
         del micro_batch
         return loss, loss_dict
 
-    def train_step(self, data_iterator: Any) -> Dict[str, float]:
+    def train_step(self, data_iterator: Any):
+        if data_iterator is None:
+            ps = get_parallel_state()
+            if not ps.sp_enabled or ps.sp_rank == 0:
+                raise RuntimeError("train_step called without a dataloader (data_iterator is None)")
+
         args = self.base.args
         self.base.state.global_step += 1
 
@@ -689,6 +702,7 @@ class DiTTrainer:
             self.base.optimizer.zero_grad()
 
         self.on_step_end(loss=total_loss, loss_dict=dict(total_loss_dict), grad_norm=grad_norm)
+        return dict(total_loss_dict)
 
     # ---- Multi-stage progressive training helpers ----
 
@@ -804,19 +818,23 @@ class DiTTrainer:
             remaining_steps = stage.max_steps - self.stage_controller.steps_in_current_stage
 
             for _ in range(remaining_steps):
+                success = False
                 try:
                     self.train_step(data_iterator)
+                    success = True
                 except StopIteration:
                     # Exhausted current dataloader — wrap around.
                     if self.base.train_dataloader is not None:
                         data_iterator = iter(self.base.train_dataloader)
                     try:
                         self.train_step(data_iterator)
+                        success = True
                     except StopIteration:
                         logger.info_rank0(f"Stage {stage.name}: dataloader exhausted even after reset, ending stage.")
                         break
 
-                self.stage_controller.step()
+                if success:
+                    self.stage_controller.step()
 
                 if self.stage_controller.should_advance():
                     break

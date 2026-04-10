@@ -555,6 +555,9 @@ class WanModel(PreTrainedModel):
 
         self.gradient_checkpointing = False
 
+        # Apply Xavier uniform initialization to all Linear and Conv3d layers.
+        self.apply(self._init_weights)
+
         # Apply zero-init to residual output projections (DiT best practice).
         # This makes each DiTBlock start as a no-op through the residual connection,
         # and the head output starts at zero, which is critical for stable DiT convergence.
