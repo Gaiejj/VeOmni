@@ -311,6 +311,7 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
         timestep: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         training_target: torch.Tensor,
+        **kwargs,
     ):
         per_sample_losses = []
         predictions = []

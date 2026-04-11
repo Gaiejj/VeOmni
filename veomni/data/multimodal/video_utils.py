@@ -22,8 +22,23 @@ import librosa
 import numpy as np
 import PIL
 import torch
-from torchcodec.decoders import VideoDecoder
 from torchvision.transforms import InterpolationMode, functional
+
+# Try torchcodec first, fall back to decord
+_USE_DECORD = False
+try:
+    from torchcodec.decoders import VideoDecoder
+except Exception:
+    try:
+        import decord
+
+        decord.bridge.set_bridge("torch")
+        _USE_DECORD = True
+    except ImportError:
+        raise ImportError(
+            "Neither torchcodec nor decord is available for video decoding. "
+            "Install one of them: pip install torchcodec  OR  pip install decord"
+        )
 
 from ...utils import logging
 from ...utils.import_utils import is_ffmpeg_available
@@ -387,6 +402,93 @@ def _apply_dynamic_video_max_pixels(nframes: int, kwargs: dict) -> dict:
     return {**kwargs, "video_max_pixels": int(dynamic_max)}
 
 
+def _decode_video_with_torchcodec(video_input, **kwargs):
+    """Decode video using torchcodec. Returns (video_fps, total_frames, duration_seconds, frames, sampled_indices, pad_count)."""
+    try:
+        decoder = VideoDecoder(video_input, device="cpu", num_ffmpeg_threads=0)
+    except Exception as e:
+        if isinstance(video_input, str) and ("http://" in video_input or "https://" in video_input):
+            logger.warning(f"Direct URL decoding failed: {e}. Downloading with ffmpeg...")
+            try:
+                video_bytes = _download_url_to_bytes(video_input)
+                decoder = VideoDecoder(video_bytes, device="cpu", num_ffmpeg_threads=0)
+            except Exception as download_error:
+                raise RuntimeError(
+                    f"Failed to decode video from URL {video_input}: {download_error}"
+                ) from download_error
+        else:
+            raise RuntimeError(f"Failed to create VideoDecoder: {e}") from e
+
+    metadata = decoder.metadata
+    video_fps = metadata.average_fps
+    total_frames = metadata.num_frames
+    duration_seconds = metadata.duration_seconds
+
+    effective_total_frames = max(1, total_frames)
+    indices, pad_count = calculate_frame_indices(total_frames=effective_total_frames, video_fps=video_fps, **kwargs)
+
+    try:
+        frames = decoder.get_frames_at(indices).data
+        sampled_indices = indices
+    except Exception as e:
+        if "Requested next frame" in str(e) or "End of stream" in str(e):
+            logger.warning(f"Decoding failed: {e}. Retrying with first frame only.")
+            try:
+                frames = decoder.get_frames_at([0]).data
+                sampled_indices = [0]
+                _, pad_count = calculate_frame_indices(total_frames=1, video_fps=video_fps, **kwargs)
+            except Exception as inner_e:
+                raise RuntimeError(f"Failed to decode even the first frame: {inner_e}") from inner_e
+        else:
+            raise e
+
+    return video_fps, total_frames, duration_seconds, frames, sampled_indices, pad_count
+
+
+def _decode_video_with_decord(video_input, **kwargs):
+    """Decode video using decord. Returns (video_fps, total_frames, duration_seconds, frames, sampled_indices, pad_count)."""
+    import decord
+
+    if isinstance(video_input, bytes):
+        from io import BytesIO
+        vr = decord.VideoReader(BytesIO(video_input), ctx=decord.cpu(0), num_threads=1)
+    elif isinstance(video_input, str):
+        if "http://" in video_input or "https://" in video_input:
+            try:
+                video_bytes = _download_url_to_bytes(video_input)
+                from io import BytesIO
+                vr = decord.VideoReader(BytesIO(video_bytes), ctx=decord.cpu(0), num_threads=1)
+            except Exception as e:
+                raise RuntimeError(f"Failed to decode video from URL {video_input}: {e}") from e
+        else:
+            vr = decord.VideoReader(video_input, ctx=decord.cpu(0), num_threads=1)
+    else:
+        raise TypeError(f"Unsupported video_input type for decord: {type(video_input)}")
+
+    total_frames = len(vr)
+    video_fps = vr.get_avg_fps()
+    duration_seconds = total_frames / video_fps if video_fps > 0 else 0.0
+
+    effective_total_frames = max(1, total_frames)
+    indices, pad_count = calculate_frame_indices(total_frames=effective_total_frames, video_fps=video_fps, **kwargs)
+
+    try:
+        # decord returns (T, H, W, C) tensor when bridge is "torch"
+        frames = vr.get_batch(indices)  # (T, H, W, C)
+        frames = frames.permute(0, 3, 1, 2)  # -> (T, C, H, W)
+        sampled_indices = indices
+    except Exception as e:
+        logger.warning(f"Decord batch decoding failed: {e}. Retrying with first frame only.")
+        try:
+            frames = vr.get_batch([0]).permute(0, 3, 1, 2)
+            sampled_indices = [0]
+            _, pad_count = calculate_frame_indices(total_frames=1, video_fps=video_fps, **kwargs)
+        except Exception as inner_e:
+            raise RuntimeError(f"Failed to decode even the first frame with decord: {inner_e}") from inner_e
+
+    return video_fps, total_frames, duration_seconds, frames, sampled_indices, pad_count
+
+
 def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_video: bool = True, **kwargs):
     """Load and process video using torchcodec (video) and PyAV (audio).
 
@@ -430,43 +532,14 @@ def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_vid
         return video, audio, audio_fps, frames_indices
 
     # video_input is str (path/URL) or bytes
-    try:
-        decoder = VideoDecoder(video_input, device="cpu", num_ffmpeg_threads=0)
-    except Exception as e:
-        if isinstance(video_input, str) and ("http://" in video_input or "https://" in video_input):
-            logger.warning(f"Direct URL decoding failed: {e}. Downloading with ffmpeg...")
-            try:
-                video_bytes = _download_url_to_bytes(video_input)
-                decoder = VideoDecoder(video_bytes, device="cpu", num_ffmpeg_threads=0)
-            except Exception as download_error:
-                raise RuntimeError(
-                    f"Failed to decode video from URL {video_input}: {download_error}"
-                ) from download_error
-        else:
-            raise RuntimeError(f"Failed to create VideoDecoder: {e}") from e
-
-    metadata = decoder.metadata
-    video_fps = metadata.average_fps
-    total_frames = metadata.num_frames
-
-    effective_total_frames = max(1, total_frames)
-
-    indices, pad_count = calculate_frame_indices(total_frames=effective_total_frames, video_fps=video_fps, **kwargs)
-
-    try:
-        frames = decoder.get_frames_at(indices).data
-        sampled_indices = indices
-    except Exception as e:
-        if "Requested next frame" in str(e) or "End of stream" in str(e):
-            logger.warning(f"Decoding failed: {e}. Retrying with first frame only.")
-            try:
-                frames = decoder.get_frames_at([0]).data
-                sampled_indices = [0]
-                _, pad_count = calculate_frame_indices(total_frames=1, video_fps=video_fps, **kwargs)
-            except Exception as e:
-                raise RuntimeError(f"Failed to decode even the first frame: {e}") from e
-        else:
-            raise e
+    if _USE_DECORD:
+        # --- decord path ---
+        video_fps, total_frames, duration_seconds, frames, sampled_indices, pad_count = \
+            _decode_video_with_decord(video_input, **kwargs)
+    else:
+        # --- torchcodec path ---
+        video_fps, total_frames, duration_seconds, frames, sampled_indices, pad_count = \
+            _decode_video_with_torchcodec(video_input, **kwargs)
 
     nframes = len(sampled_indices) + pad_count
     resize_kwargs = _apply_dynamic_video_max_pixels(nframes, kwargs)
@@ -483,7 +556,7 @@ def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_vid
     # Extract audio with PyAV
     audio, audio_fps = None, None
     if use_audio_in_video:
-        max_audio_duration = (metadata.duration_seconds or 60.0) + 1.0
+        max_audio_duration = (duration_seconds or 60.0) + 1.0
         audio, audio_fps = extract_audio_from_video(video_input, max_duration_seconds=max_audio_duration)
 
     frames_indices = torch.tensor(padded_indices, dtype=torch.long)
@@ -497,10 +570,10 @@ def fetch_videos(videos: List[VideoInput], **kwargs):
     Note: Does NOT return frames_indices. Use fetch_videos_metadata() for temporal modeling
     (e.g., Qwen3-VL timestamp calculation).
     """
-    if not is_ffmpeg_available():
+    if not _USE_DECORD and not is_ffmpeg_available():
         raise RuntimeError("ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg")
 
-    logger.info_once("Using torchcodec for video loading.")
+    logger.info_once(f"Using {'decord' if _USE_DECORD else 'torchcodec'} for video loading.")
 
     video_inputs, audio_inputs, audio_fps_list = [], [], []
 
@@ -533,10 +606,10 @@ def fetch_videos_metadata(videos: List[VideoInput], **kwargs):
     Returns:
         (videos, video_metadata, audios, audio_metadata): Processed videos and audios with metadata
     """
-    if not is_ffmpeg_available():
+    if not _USE_DECORD and not is_ffmpeg_available():
         raise RuntimeError("ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg")
 
-    logger.info_once("Using torchcodec for video loading with metadata.")
+    logger.info_once(f"Using {'decord' if _USE_DECORD else 'torchcodec'} for video loading with metadata.")
 
     video_inputs, video_metadata_list = [], []
     audio_inputs, audio_metadata_list = [], []
@@ -580,7 +653,7 @@ def load_video_from_path(video_path: str, use_audio_in_video: bool = True, **kwa
     Returns:
         (video, video_metadata, audio, audio_metadata)
     """
-    if not is_ffmpeg_available():
+    if not _USE_DECORD and not is_ffmpeg_available():
         raise RuntimeError("ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg")
 
     videos, video_meta, audios, audio_meta = fetch_videos_metadata(
@@ -600,7 +673,7 @@ def load_video_from_bytes(video_bytes: bytes, use_audio_in_video: bool = True, *
     Returns:
         (video, video_metadata, audio, audio_metadata)
     """
-    if not is_ffmpeg_available():
+    if not _USE_DECORD and not is_ffmpeg_available():
         raise RuntimeError("ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg")
 
     videos, video_meta, audios, audio_meta = fetch_videos_metadata(
@@ -638,7 +711,7 @@ def load_video_from_bytes_list(video_frames: Union[List[bytes], np.ndarray], **k
                 img = img.convert("RGB")
             pil_images.append(img.copy())
 
-    if not is_ffmpeg_available():
+    if not _USE_DECORD and not is_ffmpeg_available():
         raise RuntimeError("ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg")
 
     videos, video_meta, audios, audio_meta = fetch_videos_metadata([pil_images], **kwargs)

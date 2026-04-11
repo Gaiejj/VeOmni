@@ -1,0 +1,67 @@
+# Wan2.1 1.3B 8-GPU smoke test — validates FSDP2 + FlashAttn at scale
+# Usage: bash train.sh tests/train_scripts/train_dit_test.py configs/dit/wan_1.3b_smoke_test_8gpu.yaml
+
+model:
+  model_path: null  # From scratch
+  config_path: configs/model_configs/wan/want2v_1.3b_diffusers.json
+  ops_implementation:
+    attn_implementation: flash_attention_2
+
+data:
+  train_path: /mnt/users/jiayi/.cache/veomni/wan_t2v_1.3b/
+  datasets_type: mapping
+  max_seq_len: 32768
+  dyn_bsz_buffer_size: 1
+  dataloader:
+    type: native
+    num_workers: 4
+    drop_last: true
+    pin_memory: true
+    prefetch_factor: 2
+
+train:
+  global_batch_size: 8
+  micro_batch_size: 1
+  max_steps: 50
+  num_train_epochs: 10
+  init_device: meta
+  enable_full_determinism: false
+  empty_cache_steps: 50
+  bsz_warmup_ratio: 0
+  training_task: offline_training
+
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_warmup_ratio: 0.1
+    lr_decay_style: cosine
+    lr_decay_ratio: 1.0
+    lr_min: 1.0e-5
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+
+  accelerator:
+    dp_shard_size: 8
+    fsdp_config:
+      fsdp_mode: fsdp2
+      full_shard: true
+      reshard_after_forward: true
+      forward_prefetch: true
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+    offload_config:
+      enable_activation: false
+
+  gradient_checkpointing:
+    enable: true
+
+  checkpoint:
+    output_dir: /tmp/veomni_1.3b_smoke_test
+    save_steps: 0
+    save_epochs: 0
+    save_hf_weights: false
+
+  wandb:
+    enable: false

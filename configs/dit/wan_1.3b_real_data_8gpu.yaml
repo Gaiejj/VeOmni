@@ -1,0 +1,80 @@
+# Wan2.1 T2V 1.3B — real video data, online training, 8 GPU FSDP2
+# Usage: bash train.sh veomni/trainer/dit_trainer.py configs/dit/wan_1.3b_real_data_8gpu.yaml
+#
+# Data: parquet with columns (prompt, video_bytes, source)
+# Preprocessor: Tom-and-Jerry-VideoGeneration-Dataset (prompt + video_bytes schema)
+
+model:
+  model_path: /mnt/users/jiayi/.cache/veomni/Wan2.1-T2V-1.3B-Diffusers/transformer
+  config_path: configs/model_configs/wan/want2v_1.3b_diffusers.json
+  condition_model_path: /mnt/users/jiayi/.cache/veomni/Wan2.1-T2V-1.3B-Diffusers
+  ops_implementation:
+    attn_implementation: flash_attention_2
+
+data:
+  train_path: /mnt/users/jiayi/.cache/veomni/crush-smol-parquet/
+  source_name: Tom-and-Jerry-VideoGeneration-Dataset
+  data_type: diffusion
+  text_keys: prompt
+  datasets_type: mapping
+  max_seq_len: 8192
+  dyn_bsz_buffer_size: 1
+  mm_configs:
+    fps: 16
+    max_frames: 81
+  dataloader:
+    type: native
+    num_workers: 4
+    drop_last: true
+    pin_memory: true
+    prefetch_factor: 2
+
+train:
+  global_batch_size: 8
+  micro_batch_size: 1
+  max_steps: 50
+  num_train_epochs: 10
+  init_device: meta
+  enable_full_determinism: false
+  empty_cache_steps: 25
+  bsz_warmup_ratio: 0
+  training_task: online_training
+
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_warmup_ratio: 0.1
+    lr_decay_style: cosine
+    lr_decay_ratio: 1.0
+    lr_min: 1.0e-5
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+
+  accelerator:
+    dp_shard_size: 8
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      full_shard: true
+      reshard_after_forward: true
+      forward_prefetch: true
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+    offload_config:
+      enable_activation: false
+
+  gradient_checkpointing:
+    enable: true
+
+  checkpoint:
+    output_dir: /tmp/veomni_1.3b_real_data
+    manager: dcp
+    save_async: true
+    save_steps: 25
+    save_hf_weights: true
+    hf_save_steps: 50
+
+  wandb:
+    enable: false

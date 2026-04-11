@@ -115,6 +115,11 @@ def _compute_image_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
 
 def _compute_wan_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
     dit_latents_seqlens = []
+    if "latents" not in micro_batch:
+        # Online training: latents not yet computed at this stage.
+        # Estimate from video list length as placeholder.
+        videos = micro_batch.get("videos", [])
+        return [1] * len(videos)
     for latents in micro_batch["latents"]:
         latent_shape = latents.shape
         if len(latent_shape) == 5:
@@ -239,9 +244,9 @@ class EnvironMeter:
         mfu = flops_achieved / flops_promised
 
         # calculate average effective len and tokens per second
-        avg_effective_len = batch_tokens / self.global_batch_size
-        avg_sample_seq_len = batch_tokens / real_global_batch_size
-        tokens_per_second = batch_tokens / delta_time
+        avg_effective_len = batch_tokens / max(self.global_batch_size, 1)
+        avg_sample_seq_len = batch_tokens / max(real_global_batch_size, 1)
+        tokens_per_second = batch_tokens / max(delta_time, 1e-6)
         self.consume_tokens += batch_tokens
         self.consume_chunks += real_global_batch_size
 

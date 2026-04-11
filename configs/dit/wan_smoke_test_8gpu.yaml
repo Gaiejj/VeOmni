@@ -1,0 +1,62 @@
+# Wan2.1 8-GPU smoke test with dummy data (toy model)
+# Usage: bash train.sh tests/train_scripts/train_dit_test.py configs/dit/wan_smoke_test_8gpu.yaml
+
+model:
+  model_path: null
+  config_path: tests/toy_config/wan_t2v_toy/config.json
+  ops_implementation:
+    attn_implementation: flash_attention_2
+
+data:
+  train_path: /mnt/users/jiayi/.cache/veomni/wan_t2v/
+  datasets_type: mapping
+  max_seq_len: 8192
+  dyn_bsz_buffer_size: 1
+  dataloader:
+    type: native
+    num_workers: 0
+    drop_last: true
+    pin_memory: true
+
+train:
+  global_batch_size: 8
+  micro_batch_size: 1
+  max_steps: 10
+  num_train_epochs: 1
+  init_device: meta
+  enable_full_determinism: false
+  empty_cache_steps: 5
+  bsz_warmup_ratio: 0
+  training_task: offline_training
+
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+
+  accelerator:
+    dp_shard_size: 8
+    fsdp_config:
+      fsdp_mode: fsdp2
+      full_shard: true
+      reshard_after_forward: true
+      forward_prefetch: true
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+    offload_config:
+      enable_activation: false
+
+  gradient_checkpointing:
+    enable: true
+
+  checkpoint:
+    output_dir: /tmp/veomni_smoke_test
+    save_steps: 0
+    save_epochs: 0
+    save_hf_weights: false
+
+  wandb:
+    enable: false
